@@ -40,8 +40,9 @@ class HuggingFaceDataset(Base):
 
     split: Param[Optional[str]] = field(default=None, ignore_default=True)
     """Dataset split to load."""
-
-    revision: Param[Optional[str]] = field(default=None, ignore_default=True)
+    
+    #TODO: Local change that shoud not be merged (only for hashes)
+    revision: Meta[Optional[str]] = field(default=None, ignore_default=True)
     """HuggingFace repository git revision (commit SHA, branch, or tag)."""
 
     streaming: Meta[bool] = field(default=False, ignore_default=True)
