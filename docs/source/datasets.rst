@@ -163,6 +163,9 @@ Parameters
      - Version timestamp for evolving datasets.
    * - ``size``
      - Dataset size (for documentation).
+   * - ``requires``
+     - Python modules needed by the dataset that are not dependencies of the
+       repository (see :ref:`dataset-requirements`).
    * - ``as_prepare`` (deprecated)
      - If True, the function receives the dataset object for manual resource handling.
 
@@ -243,6 +246,81 @@ HuggingFace Integration
     class Squad(QADataset):
         HF_DATA = HFDownloader("squad_data", "squad")
 
+.. _dataset-requirements:
+
+Python Requirements
+-------------------
+
+Some datasets need Python packages that the repository does not depend on
+(e.g. HuggingFace ``datasets``, or a parser for an exotic format), typically
+because they are heavy and only useful for a few datasets. They are declared
+with ``requires``, so that datamaestro checks them *before* downloading
+anything and tells users what to install, instead of failing in the middle of
+a download with an ``ImportError``:
+
+.. code-block:: python
+
+    @dataset(
+        url="https://huggingface.co/datasets/org/name",
+        requires={"datasets": "datamaestro_myplugin[huggingface]"},
+    )
+    class MyDataset(Dataset):
+        def config(self) -> MyHFData:
+            ...
+
+``requires`` accepts a module name (``"datasets"``), a list of module names,
+or a mapping from module name to what should be installed to get it, as a
+Python requirement — typically an extra of the plugin, so that versions are
+handled in one place (the plugin's ``pyproject.toml``):
+
+.. code-block:: toml
+
+    [project.optional-dependencies]
+    huggingface = ["datasets>=2.19"]
+
+Requirements are checked when the dataset is downloaded (``prepare_dataset``,
+``datamaestro download/prepare``, or experimaestro preparing a task). If some
+are missing, the download fails with a
+:class:`~datamaestro.requirements.MissingRequirementError` (an
+``ImportError``) listing them::
+
+    Missing Python requirements for dataset org.example.name:
+      - datasets: not installed
+    Please install: datamaestro_myplugin[huggingface]
+
+A directory named like a required module (without ``__init__.py``) in the
+current directory shadows the installed package; it is reported as such
+rather than failing later with a confusing error.
+
+Requirements are shown by ``datamaestro info`` (with ``[missing]`` for those
+not available) and in the generated documentation.
+
+**Data types.** When a requirement comes from the data type rather than from
+the dataset, declare it on the type with
+:func:`~datamaestro.requirements.requires`: every dataset whose configuration
+is of this type (or of a subclass) inherits it. This is how
+:class:`~datamaestro.data.huggingface.HuggingFaceDataset` declares its
+dependency on ``datasets``. A dataset can still give a more precise
+installation target for the same module (as in the example above), which
+takes precedence:
+
+.. code-block:: python
+
+    from datamaestro.requirements import require, requires
+
+    @requires("pyarrow")
+    class MyParquetData(Base):
+        def iter(self):
+            # Checked here too: the configuration might not come from a
+            # registered dataset
+            require(self.__class__, what="MyParquetData")
+            import pyarrow.parquet as pq
+            ...
+
+Avoid importing optional modules at the top level of a dataset definition
+module: import them where they are used, so that the dataset can be listed,
+documented and checked even when they are missing.
+
 Referencing Other Datasets
 --------------------------
 
@@ -285,6 +363,117 @@ string ID rather than by class:
     @dataset(url="http://example.com")
     class ExtendedDataset(ExtendedData):
         BASE = links("base", "com.example.base_dataset")
+
+Dataset Families
+----------------
+
+When a module registers many similar datasets (one per language, per
+sub-collection, per split, …), writing one class per dataset is not
+practical. :py:class:`~datamaestro.factory.DatasetFactory` creates the
+dataset classes from a loop: it builds the
+:py:class:`~datamaestro.definitions.Dataset` subclass, applies the
+``@dataset`` decorator, and adds the class to the module namespace so that
+datamaestro discovers it.
+
+Example: a multilingual collection with, for each language, a corpus, and
+for each split, the topics and the task combining the corpus and the
+topics:
+
+.. code-block:: python
+
+    # src/datamaestro_myplugin/config/org/example/multilingual.py
+    from experimaestro import Param
+
+    from datamaestro.data import Base, File
+    from datamaestro.download import reference
+    from datamaestro.download.single import FileDownloader
+    from datamaestro.factory import DatasetFactory
+
+    URL = "https://example.org/multilingual"
+
+    # language -> available splits
+    LANGUAGES = {"en": ["train", "dev"], "sw": ["dev"]}
+
+
+    class Task(Base):
+        """A corpus with a set of topics"""
+
+        corpus: Param[File]
+        topics: Param[File]
+
+
+    def register():
+        datasets = DatasetFactory(
+            __name__, prefix="org.example.multilingual", class_prefix="Multilingual"
+        )
+
+        for lang, splits in LANGUAGES.items():
+            # org.example.multilingual.<lang>.corpus
+            # The keyword gives the resource name (here, CORPUS)
+            corpus = datasets.file(
+                f"{lang}.corpus",
+                File,
+                url=URL,
+                CORPUS=FileDownloader("corpus.jsonl", f"{URL}/{lang}/corpus.jsonl"),
+            )
+
+            for split in splits:
+                # org.example.multilingual.<lang>.<split>.topics
+                topics = datasets.file(
+                    f"{lang}.{split}.topics",
+                    File,
+                    TOPICS=FileDownloader("topics.tsv", f"{URL}/{lang}/{split}.tsv"),
+                )
+
+                # org.example.multilingual.<lang>.<split>: any configuration,
+                # built by a config(self) function from the resources
+                def config(self) -> Task:
+                    return Task.C(
+                        corpus=self.CORPUS.config(), topics=self.TOPICS.config()
+                    )
+
+                datasets.register(
+                    f"{lang}.{split}",
+                    Task,
+                    config,
+                    resources={
+                        "CORPUS": reference(corpus),
+                        "TOPICS": reference(topics),
+                    },
+                    url=URL,
+                    doc=f"Multilingual task ({lang}, {split})",
+                )
+
+
+    register()
+
+This registers ``org.example.multilingual.en.corpus``,
+``org.example.multilingual.en.train.topics``,
+``org.example.multilingual.en.train``, and so on; e.g.
+``prepare_dataset("org.example.multilingual.sw.dev")`` downloads the Swahili
+corpus and dev topics, and returns a ``Task``.
+
+A few points to keep in mind:
+
+- Dataset ids are always explicit (``<prefix>.<id>``); class names are
+  derived from the ids (here, ``Multilingual_en_train``) and only matter
+  for discovery. A name already in use gets a numeric suffix (``a-b`` and
+  ``a_b`` give ``a_b`` and ``a_b_2``), or can be set with ``name=``.
+- Resource names (``CORPUS``, ``TOPICS``) are used to track the download
+  state, so keep them stable once datasets have been downloaded.
+- Each registered dataset has its own resources and data folder. This
+  differs from :doc:`dataset variants <api/variants>`, where a single
+  dataset (and its resources) is parameterized at prepare time: use
+  variants when the variants share the same source (e.g. different
+  configurations of one HuggingFace dataset), and a factory when each
+  dataset has its own files.
+
+Plugins can subclass :py:class:`~datamaestro.factory.DatasetFactory` to add
+domain-specific builders (e.g. a document store built from a corpus file)
+on top of :py:meth:`~datamaestro.factory.DatasetFactory.register`.
+
+.. autoclass:: datamaestro.factory.DatasetFactory
+    :members: register, file, full_id, class_name
 
 Data Types
 ==========

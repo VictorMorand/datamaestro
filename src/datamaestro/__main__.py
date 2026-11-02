@@ -117,6 +117,15 @@ def info(config: Config, dataset):
         print("Tags:", ", ".join(dataset.tags))
     if dataset.tasks:
         print("Tasks:", ", ".join(dataset.tasks))
+    if dataset.requirements:
+        missing = set(dataset.missing_requirements())
+        print(
+            "Requires:",
+            ", ".join(
+                f"{r}{' [missing]' if r in missing else ''}"
+                for r in dataset.requirements
+            ),
+        )
 
     variants = getattr(dataset, "variants", None)
     if variants is not None:
@@ -212,17 +221,57 @@ def version():
 
 
 @click.option("--size", is_flag=True, help="Show size")
-@cli.command(help="List (and remove) orphan directories")
+@cli.command(
+    help="List orphan directories (not defined in this environment; "
+    "registered ones are marked)"
+)
 @pass_cfg
 def orphans(config: Config, size):
+    """Lists the folders that do not correspond to a dataset
+
+    Datasets defined in another Python environment (e.g. by another version
+    of their repository) are only known from the ds-cache-cleaner registry:
+    their folder is listed with the registered id and repository version
+    """
     import subprocess
+
+    from datamaestro import cleaner
+
+    try:
+        registered = cleaner.entries(config.context)
+    except Exception:
+        registered = {}
+
+    def note(path: Path) -> str:
+        try:
+            relpath = path.relative_to(config.context.datapath).as_posix()
+        except ValueError:
+            return ""
+        if (entry := registered.get(relpath)) is None:
+            return ""
+        metadata = entry.metadata
+        version = metadata.get("repository_version")
+        return (
+            f"  [registered: {metadata.get('id', relpath)}"
+            f"{f', version {version}' if version else ''}]"
+        )
+
+    # Registered folders are shown even when inside an orphan folder
+    registered_ancestors: Set[Path] = set()
+    for relpath in registered:
+        ancestor = (config.context.datapath / relpath).parent
+        while ancestor not in registered_ancestors and ancestor != ancestor.parent:
+            registered_ancestors.add(ancestor)
+            ancestor = ancestor.parent
 
     for repository in config.context.repositories():
         # For each repository
         paths = set()
         ancestors: Set[Path] = set()
         for dataset in repository:
-            if dataset.hasfiles():
+            # Some datasets (e.g. from plugins) only define hasfiles()
+            has_files = getattr(type(dataset), "has_files", None)
+            if has_files(dataset) if has_files else dataset.hasfiles():
                 paths.add(dataset.datapath)
                 ancestor = dataset.datapath.parent
                 while ancestor not in ancestors:
@@ -232,15 +281,16 @@ def orphans(config: Config, size):
         def lookup(path, prefix=[]):
             if path in paths:
                 return
-            if path not in ancestors:
+            if path not in ancestors and path not in registered_ancestors:
                 if size:
                     print(
                         subprocess.check_output(["du", "-hs", path.absolute()])
                         .decode("utf-8")
-                        .strip(),
+                        .strip()
+                        + note(path),
                     )
                 else:
-                    print(path)
+                    print(f"{path}{note(path)}")
                 return
 
             for child in path.iterdir():
@@ -249,7 +299,48 @@ def orphans(config: Config, size):
                 else:
                     return True
 
-        lookup(repository.datapath)
+        if repository.datapath.is_dir():
+            lookup(repository.datapath)
+
+
+@cli.group(help="Manage the ds-cache-cleaner registry of downloaded datasets")
+def cache():
+    pass
+
+
+@cache.command(
+    "sync",
+    help="Register the downloaded datasets with ds-cache-cleaner, "
+    "and forget the deleted ones",
+)
+@click.option("--dry-run", is_flag=True, help="Only show what would change")
+@pass_cfg
+def cache_sync(config: Config, dry_run: bool):
+    from datamaestro.cleaner import sync
+
+    report = sync(config.context, dry_run=dry_run)
+    for path in report.added:
+        print(f"+ {path}")
+    for path in report.removed:
+        print(f"- {path}")
+    print(
+        f"{len(report.added)} registered, {len(report.removed)} removed"
+        + (" (dry run)" if dry_run else "")
+    )
+
+
+@cli.command(help="Web interface to browse the datasets (needs datamaestro[gui])")
+@click.option("--host", default="127.0.0.1", help="Address to listen on")
+@click.option("--port", default=8080, type=int, help="Port to listen on")
+@click.option(
+    "--refresh", is_flag=True, help="Reload all the dataset definitions first"
+)
+@click.option("--show", is_flag=True, help="Open the interface in a browser")
+@pass_cfg
+def serve(config: Config, host: str, port: int, refresh: bool, show: bool):
+    from datamaestro.gui import serve
+
+    serve(config.context, host=host, port=port, refresh=refresh, show=show)
 
 
 # --- Manage external data folders
@@ -430,47 +521,41 @@ def prepare(config: Config, datasetid, encoder, no_downloads):
 # --- Search
 
 
-@click.argument("searchterms", nargs=-1)  # , description="Search terms (e.g. tag:XXX)")
+@click.argument("searchterms", nargs=-1)
+@click.option(
+    "--refresh", is_flag=True, help="Reload all the dataset definitions first"
+)
+@click.option(
+    "--errors", is_flag=True, help="Show the definition modules that failed to load"
+)
 @cli.command(help="Search for a dataset")
 @pass_cfg
-def search(config: Config, searchterms):
+def search(config: Config, searchterms, refresh: bool, errors: bool):
     """Search for a dataset
 
-    Repositories can be searched with repo:REGEX expression
-    Tags can be searched with tag:REGEX expression
-    Tasks can be searched with task:REGEX expression
+    All the terms must match (case-insensitive regular expressions). A term
+    can be restricted to a field with a prefix: tag:, task:, type:, repo:
+    (or repository:) and id:. Other terms are matched against the id,
+    name, description, tags, tasks and variant values of the datasets.
 
-    When no search modifier `MODIFIER:` is given, matches the dataset
-
+    The dataset list is cached (see --refresh).
     """
-    from .search import Condition, AndCondition
+    from .catalog import Catalog
 
-    condition = AndCondition()
-    for searchterm in searchterms:
-        condition.append(Condition.parse(searchterm))
+    catalog = Catalog.load(config.context, refresh=refresh)
+    for entry in catalog.search(searchterms):
+        suffix = ""
+        if entry.variants is not None:
+            axes = [axis.name for axis in entry.variants.axes or []]
+            suffix = f"[{','.join(sorted(axes))}]" if axes else "[...]"
+        cfg = entry.config_type.rsplit(".", 1)[-1] if entry.config_type else "?"
+        print(f"[{entry.repository}] {entry.id}{suffix} ({cfg})")
 
-    logging.debug("Search: %s", condition)
-    for dataset in config.context.datasets():
-        try:
-            if condition.match(dataset):
-                cfg = dataset.configtype
-                variants = getattr(dataset, "variants", None)
-                suffix = ""
-                if variants is not None:
-                    axes = getattr(variants, "axes", None)
-                    if axes:
-                        suffix = "[" + ",".join(sorted(axes)) + "]"
-                    else:
-                        suffix = "[...]"
-                print(
-                    "[%s] %s%s (%s)"
-                    % (
-                        dataset.repository.id,
-                        dataset.id,
-                        suffix,
-                        cfg.__name__ if cfg is not None else "?",
-                    )
-                )
-        except Exception:
-            logging.error("Error while matching with dataset %s", dataset)
-            raise
+    if errors:
+        for error in catalog.errors:
+            print(f"{error.source}: {error.error}", file=sys.stderr)
+    elif catalog.errors:
+        logging.warning(
+            "%d definition modules could not be loaded (see --errors)",
+            len(catalog.errors),
+        )
